@@ -112,3 +112,7 @@ func (conn *RemoteConn) Call(method, resource string, args ...interface{}) (*fas
 func (conn *RemoteConn) CallCompact(method, resource string, args ...interface{}) (*fastjson.Value, error) {
 	return conn.do(request(conn.nextID(), method, resource, args, true))
 }
+
+func (conn *RemoteConn) Close() {
+	conn.ws.Close()
+}
