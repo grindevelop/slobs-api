@@ -3,7 +3,7 @@ package slobsapi
 import (
 	"errors"
 
-	"github.com/buger/jsonparser"
+	"github.com/valyala/fastjson"
 
 	"github.com/gorilla/websocket"
 )
@@ -22,9 +22,21 @@ type params struct {
 }
 
 type RemoteConn struct {
-	WebSocket *websocket.Conn
-	response  chan []byte
-	id        int
+	ws       *websocket.Conn
+	response chan *fastjson.Value
+	nextID   func() int
+}
+
+func idGenerator() func() int {
+	var id int
+	return func() int {
+		if id < 1 {
+			id = 1
+		} else {
+			id++
+		}
+		return id
+	}
 }
 
 func request(id int, method, resource string, args []interface{}, compact bool) *rpcRequest {
@@ -40,60 +52,63 @@ func request(id int, method, resource string, args []interface{}, compact bool) 
 	}
 }
 
-func (rc *RemoteConn) nextID() int {
-	rc.id++
-	if rc.id == 0 {
-		rc.id++
-	}
-	return rc.id
+func Connect(urlStr string) (*RemoteConn, error) {
+	conn, _, err := websocket.DefaultDialer.Dial(urlStr, nil)
+	return &RemoteConn{ws: conn, nextID: idGenerator()}, err
 }
 
-func (rc *RemoteConn) ListenEvents(receive chan []byte) error {
-	rc.response = make(chan []byte)
-	for {
-		_, message, err := rc.WebSocket.ReadMessage()
-		if err != nil {
-			return err
-		}
-		if s, _ := jsonparser.GetString(message, "result", "_type"); s == "EVENT" {
-			result, _, _, _ := jsonparser.Get(message, "result")
-			receive <- result
-		} else {
-			rc.response <- message
-		}
-	}
-}
-
-func (rc *RemoteConn) send(request *rpcRequest) ([]byte, error) {
-	err := rc.WebSocket.WriteJSON(request)
+func (conn *RemoteConn) do(request *rpcRequest) (*fastjson.Value, error) {
+	err := conn.ws.WriteJSON(request)
 	if err != nil {
 		return nil, err
 	}
-	var response []byte
-	if rc.response != nil {
-		response = <-rc.response
+	var response *fastjson.Value
+	if conn.response != nil {
+		response = <-conn.response
 	} else {
-		err := rc.WebSocket.ReadJSON(&response)
+		_, message, err := conn.ws.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		response, err = fastjson.ParseBytes(message)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if msg, err := jsonparser.GetString(response, "error", "message"); err == nil {
-		return nil, errors.New(msg)
+	if msg := response.GetStringBytes("error", "message"); msg != nil {
+		return nil, errors.New(string(msg))
 	}
-	result, _, _, _ := jsonparser.Get(response, "result")
-	return result, nil
+	return response.Get("result"), nil
 }
 
-func (rc *RemoteConn) Call(method, resource string, args ...interface{}) ([]byte, error) {
-	return rc.send(request(rc.nextID(), method, resource, args, false))
+func (conn *RemoteConn) ListenEvents(receive chan *fastjson.Value) error {
+	conn.response = make(chan *fastjson.Value)
+	for {
+		_, message, err := conn.ws.ReadMessage()
+		if err != nil {
+			return err
+		}
+		response, err := fastjson.ParseBytes(message)
+		if err != nil {
+			return err
+		}
+		if string(response.GetStringBytes("result", "_type")) == "EVENT" {
+			receive <- response.Get("result")
+		} else {
+			conn.response <- response
+		}
+	}
 }
 
-func (rc *RemoteConn) CallCompact(method, resource string, args ...interface{}) ([]byte, error) {
-	return rc.send(request(rc.nextID(), method, resource, args, true))
-}
-
-func (rc *RemoteConn) Notify(method, resource string, args ...interface{}) error {
-	err := rc.WebSocket.WriteJSON(request(rc.nextID(), method, resource, args, false))
+func (conn *RemoteConn) Notify(method, resource string, args ...interface{}) error {
+	err := conn.ws.WriteJSON(request(conn.nextID(), method, resource, args, false))
 	return err
+}
+
+func (conn *RemoteConn) Call(method, resource string, args ...interface{}) (*fastjson.Value, error) {
+	return conn.do(request(conn.nextID(), method, resource, args, false))
+}
+
+func (conn *RemoteConn) CallCompact(method, resource string, args ...interface{}) (*fastjson.Value, error) {
+	return conn.do(request(conn.nextID(), method, resource, args, true))
 }
